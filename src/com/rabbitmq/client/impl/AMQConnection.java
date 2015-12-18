@@ -145,7 +145,8 @@ public class AMQConnection extends ShutdownNotifierComponent implements Connecti
     /**
      * Count of socket-timeouts that have happened without any incoming frames
      */
-    private int _missedHeartbeats;
+    private int _socketTimeouts;
+    private double _missedHeartbeats;
 
     /**
      * Currently-configured heartbeat interval, in seconds. 0 meaning none.
@@ -213,6 +214,7 @@ public class AMQConnection extends ShutdownNotifierComponent implements Connecti
         _frameHandler = frameHandler;
         _running = true;
         _frameMax = 0;
+        _socketTimeouts = 0;
         _missedHeartbeats = 0;
         _heartbeat = 0;
         _exceptionHandler = exceptionHandler;
@@ -247,7 +249,15 @@ public class AMQConnection extends ShutdownNotifierComponent implements Connecti
         _channel0.enqueueRpc(connStartBlocker);
         // The following two lines are akin to AMQChannel's
         // transmit() method for this pseudo-RPC.
-        _frameHandler.setTimeout(HANDSHAKE_TIMEOUT);
+        /*
+         *  FVDABEELE: don't set this timeout because it make the rabbitmq client's read operations block for ~10000 millis on java libraries with seemingly broken concurrency implementations (e.g. GNU classpath).
+         *  Strangely enough these read operations don't block for so long when running the same code locally ... 
+         *  Instead set the time out to 250 ms, note when this is too short it can cause other problems ... Ideally this should be tuned to the RTT between client and broker.
+         *  Actually the handshake can take 10 seconds to complete, just the read operation should not block for 15 000 millis when there is still some other IO pending.
+         *  It seems there are troubles with concurrency on the centrale where we are blocking on a read when we should not block, e.g. maybe a write has to complete before we read or maybe we should not block at all. 
+         */
+        //_frameHandler.setTimeout(HANDSHAKE_TIMEOUT);
+        _frameHandler.setTimeout(250);
         _frameHandler.sendHeader();
 
         // start the main loop going
@@ -356,7 +366,9 @@ public class AMQConnection extends ShutdownNotifierComponent implements Connecti
             // Divide by four to make the maximum unwanted delay in
             // sending a timeout be less than a quarter of the
             // timeout setting.
-            _frameHandler.setTimeout(heartbeat * 1000 / 4);
+            // FVDABEELE: don't set this ...
+            //_frameHandler.setTimeout(heartbeat * 1000 / 4);
+            _frameHandler.setTimeout(250); // FVDABEELE: we need this call, otherwise SocketException is not thrown in this code block
         } catch (SocketException se) {
             // should do more here?
         }
@@ -421,7 +433,9 @@ public class AMQConnection extends ShutdownNotifierComponent implements Connecti
                     Frame frame = readFrame();
 
                     if (frame != null) {
-                        _missedHeartbeats = 0;
+                        //_missedHeartbeats = 0; // FVDABEELE
+                        _socketTimeouts = 0;
+
                         if (frame.type == AMQP.FRAME_HEARTBEAT) {
                             // Ignore it: we've already just reset the heartbeat counter.
                         } else {
@@ -476,13 +490,31 @@ public class AMQConnection extends ShutdownNotifierComponent implements Connecti
             return;
         }
 
-        _missedHeartbeats++;
+        // FVDABEELE: decouple the number of socket time outs from the number of missed heart beats
+        // This is because we want to be able to let socket read operations time out faster than the heartbeat interval, this is due to a concurrency bug on the centrale
+        // So for example, only every fourth socket timeout (this depending obviously on the socket timeout interval) will correspond to a missed heart beat (instead of every one timeout for one missed heartbeat)
+
+        try {
+                _socketTimeouts += _frameHandler.getTimeout(); // keep track of the total sum of time after which the socket has timed out
+                _missedHeartbeats = (double)_socketTimeouts / (_heartbeat*1000); // say we have a total sum of 20 000ms and the hearbeat interval is 15s, then we have missed one heart beat 
+        } catch (SocketException ex) {
+                System.err.println("Exception when retrieving the socket timeout. Assuming connection is broken." + ex);
+                ex.printStackTrace();
+
+                 // Assuming connection is broken, so set _missedHeartbeats to greater than 2 (e.g 3) so we tear down the connection
+                 _missedHeartbeats = 3;
+        }
+
+        // System.err.println("_socketTimeouts = " + _socketTimeouts + " (_heartbeat*1000 = " + _heartbeat*1000 + ")");
 
         // We check against 8 = 2 * 4 because we need to wait for at
         // least two complete heartbeat setting intervals before
         // complaining, and we've set the socket timeout to a quarter
         // of the heartbeat setting in setHeartbeat above.
-        if (_missedHeartbeats > (2 * 4)) {
+        //if (_missedHeartbeats > (2 * 4)) {
+        // FVDABEELE: the coupling has been removed, so now we just check for more than two (e.g. 2.1 or 2.12)
+        if (_missedHeartbeats > 2) {
+
             throw new MissedHeartbeatException("Heartbeat missing with heartbeat == " +
                                                _heartbeat + " seconds");
         }
